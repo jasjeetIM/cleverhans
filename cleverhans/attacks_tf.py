@@ -748,7 +748,7 @@ class CarliniWagnerL2(object):
                                                          self.loss_cos,
                                                          self.loss_norm])
                 
-                  print ('Loss: %.5f, Cos: %.5f, Norm: %.5f' % (l, -cos, norm))
+                  #print ('Loss: %.5f, Cos: %.5f, Norm: %.5f' % (l, -cos, norm))
                 else:
                   _, l, l2s, scores, nimg = self.sess.run([self.train,
                                                          self.loss,
