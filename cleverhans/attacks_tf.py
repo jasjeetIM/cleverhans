@@ -615,7 +615,7 @@ class CarliniWagnerL2(object):
             loss1 = tf.maximum(0.0, other - real + self.CONFIDENCE)
             if self.use_cos_norm_reg:
               self.loss_cos = tf.maximum(-(tf.reduce_sum(
-				tf.multiply(self.grad_curr, self.grad_guide)) / tf.norm(self.grad_curr)*tf.norm(self.grad_guide)) + 1.0, 0.0)
+				tf.multiply(self.grad_curr, self.grad_guide)) / (tf.norm(self.grad_curr)*tf.norm(self.grad_guide))) + 1.0, 0.0)
               self.loss_norm = tf.norm(self.grad_curr)
         else:
             # if untargeted, optimize for making this class least likely.
