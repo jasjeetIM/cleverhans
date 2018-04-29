@@ -633,9 +633,9 @@ class CarliniWagnerL2(Attack):
         self.feedable_kwargs = {'y': tf.float32,
                                 'y_target': tf.float32}
 
-        self.structural_kwargs = ['guide_img', 'batch_size', 'confidence',
+        self.structural_kwargs = ['guide_img', 'train_grads', 'batch_size', 'confidence',
                                   'targeted', 'learning_rate','use_cos_norm_reg',
-                                  'binary_search_steps', 'max_iterations',
+                                  'binary_search_steps', 'max_iterations','use_logreg','num_logreg','num_params',
                                   'abort_early', 'initial_const',
                                   'clip_min', 'clip_max']
 
@@ -685,21 +685,24 @@ class CarliniWagnerL2(Attack):
         import tensorflow as tf
         from .attacks_tf import CarliniWagnerL2 as CWL2
         self.parse_params(**kwargs)
-
         labels, nb_classes = self.get_or_guess_labels(x, kwargs)
         attack = CWL2(self.sess, self.model, self.batch_size,
                       self.confidence, 'y_target' in kwargs,
                       self.learning_rate, self.binary_search_steps,
                       self.max_iterations, self.abort_early,
                       self.initial_const, self.clip_min, self.clip_max,
-                      nb_classes, x.get_shape().as_list()[1:], self.use_cos_norm_reg)
+                      nb_classes, x.get_shape().as_list()[1:], self.use_cos_norm_reg, self.use_logreg, self.num_logreg, self.num_params)
         
         
         if self.use_cos_norm_reg:
           def cw_wrap(x_val,y_val,x_guide):
-            return np.array(attack.attack(x_val, y_val, x_guide), dtype=np.float32)
+            return np.array(attack.attack(x_val, y_val, gimgs=x_guide), dtype=np.float32)
           wrap = tf.py_func(cw_wrap, [x,labels, self.guide_img], tf.float32)
-
+        elif self.use_logreg:
+          def cw_wrap(x_val,y_val,train_grads):
+            return np.array(attack.attack(x_val, y_val, grads=train_grads), dtype=np.float32)
+          wrap = tf.py_func(cw_wrap, [x,labels, self.train_grads], tf.float32)
+        
         else:
           def cw_wrap(x_val,  y_val):
             return np.array(attack.attack(x_val, y_val), dtype=np.float32)
@@ -707,9 +710,9 @@ class CarliniWagnerL2(Attack):
           
         return wrap
 
-    def parse_params(self, y=None, y_target=None, use_cos_norm_reg=False,guide_img=None,nb_classes=None,
-                     batch_size=1, confidence=0,
-                     learning_rate=5e-3,
+    def parse_params(self, y=None, y_target=None,use_cos_norm_reg=False,guide_img=None,nb_classes=None,
+                     batch_size=1, confidence=0,use_logreg=False, num_logreg=100,train_grads=None,
+                     learning_rate=5e-3,num_params=100,
                      binary_search_steps=5, max_iterations=1000,
                      abort_early=True, initial_const=1e-2,
                      clip_min=0, clip_max=1):
@@ -729,8 +732,10 @@ class CarliniWagnerL2(Attack):
         self.clip_max = clip_max
         self.guide_img = guide_img
         self.use_cos_norm_reg = use_cos_norm_reg
-
-
+        self.use_logreg = use_logreg
+        self.num_logreg = num_logreg
+        self.train_grads = train_grads
+        self.num_params = num_params
 class ElasticNetMethod(Attack):
     """
     This attack features L1-oriented adversarial examples and includes

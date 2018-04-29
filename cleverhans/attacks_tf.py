@@ -3,7 +3,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-import copy
+import copy,time
 import numpy as np
 from six.moves import xrange
 import tensorflow as tf
@@ -465,7 +465,8 @@ class CarliniWagnerL2(object):
                  targeted, learning_rate,
                  binary_search_steps, max_iterations,
                  abort_early, initial_const,
-                 clip_min, clip_max, num_labels, shape, use_cos_norm_reg):
+                 clip_min, clip_max, num_labels, 
+                 shape, use_cos_norm_reg, use_logreg, num_logreg, num_params):
         """
         Return a tensor that constructs adversarial examples for the given
         input. Generate uses tf.py_func in order to operate over tensors.
@@ -519,9 +520,10 @@ class CarliniWagnerL2(object):
         self.clip_max = clip_max
         self.model = model
         self.use_cos_norm_reg = use_cos_norm_reg
-
         self.repeat = binary_search_steps >= 10
-
+        self.num_logreg = num_logreg
+        self.num_params = num_params
+        self.use_logreg = use_logreg
         self.shape = shape = tuple([batch_size] + list(shape))
 
         # the variable we're going to optimize over
@@ -548,11 +550,26 @@ class CarliniWagnerL2(object):
                                           name='assign_tlab')
         self.assign_const = tf.placeholder(tf.float32, [batch_size],
                                            name='assign_const')
+        #Get model params
+        self.model_params = []
+        for layer in self.model.get_layers():
+          for weight in layer.trainable_weights:
+            self.model_params.append(weight)  
+        #Check to see if we have the right number of params        
+        num_params = 0
+        for param in self.model_params:
+          num_params+=tf.reduce_prod(param.shape)
+        
+
+        grad_shape = tuple([1, self.num_logreg,self.num_params])
         #Placeholder for guide images
         if self.use_cos_norm_reg:
           self.assign_gimg = tf.placeholder(tf.float32, shape,
                                            name='assign_gimg')
-
+        if self.use_logreg:
+          self.assign_grads = tf.placeholder(tf.float32, grad_shape)
+          self.grads = tf.Variable(np.zeros(grad_shape),
+                                    dtype=tf.float32, name='grads')
         # the resulting instance, tanh'd to keep bounded from clip_min
         # to clip_max
         self.newimg = (tf.tanh(modifier + self.timg) + 1) / 2
@@ -568,36 +585,29 @@ class CarliniWagnerL2(object):
         if self.use_cos_norm_reg:
           self.loss_guide = tf.nn.softmax_cross_entropy_with_logits(logits=self.output_guide, labels=self.tlab)
         
-        if self.use_cos_norm_reg:
-          #Get model params
-          self.model_params = []
-          for layer in self.model.get_layers():
-            for weight in layer.trainable_weights:
-              self.model_params.append(weight)  
-
-          #Check to see if we have the right number of params        
-          num_params = 0
-          for param in self.model_params:
-            num_params+=tf.reduce_prod(param.shape)
-
+        if self.use_cos_norm_reg or self.use_logreg:
           #Get gradients of loss wrt input
           self.grad_curr = tf.gradients(self.loss_curr, self.model_params)
-          self.grad_guide = tf.gradients(self.loss_guide, self.model_params)
+          if self.use_cos_norm_reg:
+            self.grad_guide = tf.gradients(self.loss_guide, self.model_params)
         
           #reshape gradients into a 1-D vector
           for j in range(len(self.grad_curr)):
             if j == 0:
               temp_curr = tf.reshape(self.grad_curr[j], [-1])
-              temp_guide = tf.reshape(self.grad_guide[j], [-1])
+              if self.use_cos_norm_reg:
+                temp_guide = tf.reshape(self.grad_guide[j], [-1])
             else:
               temp_curr_t = tf.reshape(self.grad_curr[j], [-1])
-              temp_guide_t = tf.reshape(self.grad_guide[j], [-1])
               temp_curr = tf.concat([temp_curr, temp_curr_t], 0)
-              temp_guide = tf.concat([temp_guide, temp_guide_t], 0)
+              if self.use_cos_norm_reg:
+                temp_guide_t = tf.reshape(self.grad_guide[j], [-1])
+                temp_guide = tf.concat([temp_guide, temp_guide_t], 0)
 
           self.grad_curr = temp_curr
-          self.grad_guide = temp_guide 
-
+          if self.use_cos_norm_reg:
+            self.grad_guide = temp_guide 
+        
         # distance to the input data
         self.other = (tf.tanh(self.timg) + 1) / \
             2 * (clip_max - clip_min) + clip_min
@@ -617,22 +627,31 @@ class CarliniWagnerL2(object):
               self.loss_cos = tf.maximum(-(tf.reduce_sum(
 				tf.multiply(self.grad_curr, self.grad_guide)) / (tf.norm(self.grad_curr)*tf.norm(self.grad_guide))) + 1.0, 0.0)
               self.loss_norm = tf.norm(self.grad_curr)
+            if self.use_logreg:
+              #Hard coding  margin of 1
+              self.loss_cos = tf.maximum(-1.0, tf.reduce_sum(tf.matmul(tf.squeeze(self.grads), tf.reshape( (self.grad_curr/tf.norm(self.grad_curr)), [-1,1])    )))
+              self.loss_norm = tf.norm(self.grad_curr)
+
         else:
             # if untargeted, optimize for making this class least likely.
             loss1 = tf.maximum(0.0, real - other + self.CONFIDENCE)
+            if self.use_logreg:
+              #Hard coding  margin of 5
+              self.loss_cos = tf.maximum(-5.0, tf.reduce_sum(tf.matmul(tf.squeeze(self.grads), tf.reshape( (self.grad_curr/tf.norm(self.grad_curr)), [-1,1])    )))
+              self.loss_norm = tf.norm(self.grad_curr)
 
         # sum up the losses
         self.loss2 = tf.reduce_sum(self.l2dist)
 
         #Update loss function to include cos sim and norm regularization (we use batch size 1)
-        if self.use_cos_norm_reg:
+        if self.use_cos_norm_reg or self.use_logreg:
           self.loss1 = tf.reduce_sum(self.const * (loss1 + self.loss_cos + self.loss_norm))
         #Keep the same loss function
         else:
           self.loss1 = tf.reduce_sum(self.const * loss1)
 
         self.loss = self.loss1 + self.loss2
-    
+
         # Setup the adam optimizer and keep track of variables we're creating
         start_vars = set(x.name for x in tf.global_variables())
         optimizer = tf.train.AdamOptimizer(self.LEARNING_RATE)
@@ -647,30 +666,37 @@ class CarliniWagnerL2(object):
         self.setup.append(self.const.assign(self.assign_const))
         if self.use_cos_norm_reg:
           self.setup.append(self.gimg.assign(self.assign_gimg))
+        if self.use_logreg:
+          self.setup.append(self.grads.assign(self.assign_grads))
         self.init = tf.variables_initializer(var_list=[modifier] + new_vars)
 
-    def attack(self, imgs, targets, gimgs=None):
+    def attack(self, imgs, targets, gimgs=None, grads=None):
         """
         Perform the L_2 attack on the given instance for the given targets.
 
         If self.targeted is true, then the targets represents the target labels
         If self.targeted is false, then targets are the original class labels
         """
-
+      
         r = []
         for i in range(0, len(imgs), self.batch_size):
+            #ti = time.time()
             #print ('Running attack on sample %d' % i)
             _logger.debug(("Running CWL2 attack on instance " +
                            "{} of {}").format(i, len(imgs)))
             if gimgs is not None:
               r.extend(self.attack_batch(imgs[i:i + self.batch_size],targets[i:i+self.batch_size],
-                                       gimgs[i:i + self.batch_size]))
+                                       gimgs=gimgs[i:i + self.batch_size]))
+            elif grads is not None:
+              r.extend(self.attack_batch(imgs[i:i + self.batch_size],targets[i:i+self.batch_size],
+                                       grads=grads))
             else:
               r.extend(self.attack_batch(imgs[i:i + self.batch_size],
                                        targets[i:i + self.batch_size]))
+            #print (time.time() - ti)
         return np.array(r)
 
-    def attack_batch(self, imgs, labs, gimgs=None):
+    def attack_batch(self, imgs, labs, gimgs=None, grads=None):
         """
         Run the attack on a batch of instance and labels.
         """
@@ -686,7 +712,6 @@ class CarliniWagnerL2(object):
                 return x == y
             else:
                 return x != y
-
         batch_size = self.batch_size
 
         oimgs = np.clip(imgs, self.clip_min, self.clip_max)
@@ -707,6 +732,8 @@ class CarliniWagnerL2(object):
         # placeholders for the best l2, score, and instance attack found so far
         o_bestl2 = [1e10] * batch_size
         o_bestscore = [-1] * batch_size
+        o_bestcos = [1e10] * batch_size
+        o_bestnorm = [1e10] * batch_size
         o_bestattack = np.copy(oimgs)
         for outer_step in range(self.BINARY_SEARCH_STEPS):
             # completely reset adam's internal state.
@@ -714,31 +741,40 @@ class CarliniWagnerL2(object):
             batch = imgs[:batch_size]
             if gimgs is not None:
               gbatch = gimgs[:batch_size]
-
+            if grads is not None:
+              dbatch = grads[:batch_size]
             batchlab = labs[:batch_size]
 
             bestl2 = [1e10] * batch_size
             bestscore = [-1] * batch_size
+            bestcos = [1e10] * batch_size
+            bestnorm = [1e10] * batch_size
             _logger.debug("  Binary search step {} of {}".
                           format(outer_step, self.BINARY_SEARCH_STEPS))
 
             # The last iteration (if we run many steps) repeat the search once.
             if self.repeat and outer_step == self.BINARY_SEARCH_STEPS - 1:
                 CONST = upper_bound
-
+           
             if gimgs is not None:
               # set the variables so that we don't have to send them over again
               self.sess.run(self.setup, {self.assign_timg: batch,
                                        self.assign_gimg: gbatch,
                                        self.assign_tlab: batchlab,
                                        self.assign_const: CONST})
+            elif grads is not None:
+              # set the variables so that we don't have to send them over again
+              self.sess.run(self.setup, {self.assign_timg: batch,
+                                       self.assign_grads: dbatch,
+                                       self.assign_tlab: batchlab,
+                                       self.assign_const: CONST})
+         
             else:
               self.sess.run(self.setup, {self.assign_timg: batch,
                                        self.assign_tlab: batchlab,
                                        self.assign_const: CONST})
             prev = 1e6
             for iteration in range(self.MAX_ITERATIONS):
-                # perform the attack
                 if gimgs is not None:
                   _, l, l2s, scores, nimg, cos, norm = self.sess.run([self.train,
                                                          self.loss,
@@ -748,14 +784,23 @@ class CarliniWagnerL2(object):
                                                          self.loss_cos,
                                                          self.loss_norm])
                 
-                  #print ('Loss: %.5f, Cos: %.5f, Norm: %.5f' % (l, -cos, norm))
+                  #print ('Loss: %.5f, Cos: %.5f, Norm: %.5f, L2-Dis: %.5f' % (l, cos, norm, np.sqrt(l2s)))
+                elif grads is not None:
+                  _, l, l2s, scores, nimg, cos, norm = self.sess.run([self.train,
+                                                         self.loss,
+                                                         self.l2dist,
+                                                         self.output,
+                                                         self.newimg, 
+                                                         self.loss_cos,
+                                                         self.loss_norm])
+                
+                  #print ('Loss: %.5f, Cos: %.5f, Norm: %.5f, L2-Dis: %.5f' % (l, cos, norm, np.sqrt(l2s)))
                 else:
                   _, l, l2s, scores, nimg = self.sess.run([self.train,
                                                          self.loss,
                                                          self.l2dist,
                                                          self.output,
                                                          self.newimg]) 
-
                 #if iteration % ((self.MAX_ITERATIONS // 10) or 1) == 0:
                  
                    # _logger.debug(("    Iteration {} of {}: loss={:.3g} " +
@@ -772,16 +817,34 @@ class CarliniWagnerL2(object):
                         break
                     prev = l
 
-                # adjust the best result found so far
-                for e, (l2, sc, ii) in enumerate(zip(l2s, scores, nimg)):
-                    lab = np.argmax(batchlab[e])
-                    if l2 < bestl2[e] and compare(sc, lab):
-                        bestl2[e] = l2
-                        bestscore[e] = np.argmax(sc)
-                    if l2 < o_bestl2[e] and compare(sc, lab):
-                        o_bestl2[e] = l2
-                        o_bestscore[e] = np.argmax(sc)
-                        o_bestattack[e] = ii
+
+                if grads is None and gimgs is None:
+                  # adjust the best result found so far
+                  for e, (l2, sc, ii) in enumerate(zip(l2s, scores, nimg)):
+                      lab = np.argmax(batchlab[e])
+                      if l2 < bestl2[e] and compare(sc, lab):
+                          bestl2[e] = l2
+                          bestscore[e] = np.argmax(sc)
+                      if l2 < o_bestl2[e] and compare(sc, lab):
+                          o_bestl2[e] = l2
+                          o_bestscore[e] = np.argmax(sc)
+                          o_bestattack[e] = ii
+
+                else:
+                  #We update if cos and norm is reducing
+                  for e, (l2, cs, nm, sc, ii) in enumerate(zip(l2s, [cos], [norm], scores, nimg)):
+                      lab = np.argmax(batchlab[e])
+                      if cs < bestcos[e] and nm < bestnorm[e] and compare(sc, lab):
+                          bestcos[e] = cs
+                          bestnorm[e] = nm
+                          bestl2[e] = l2
+                          bestscore[e] = np.argmax(sc)
+                      if cs < o_bestcos[e] and nm < o_bestnorm[e] and compare(sc, lab):
+                          o_bestcos[e] = cs
+                          o_bestnorm[e] = nm
+                          o_bestl2[e] = l2
+                          o_bestscore[e] = np.argmax(sc)
+                          o_bestattack[e] = ii
 
             # adjust the constant as needed
             for e in range(batch_size):
@@ -1206,7 +1269,6 @@ def deepfool_attack(sess, x, predictions, logits, grads, sample, nb_candidate,
     :return: Adversarial examples
     """
     import copy
-
     adv_x = copy.copy(sample)
     # Initialize the loop variables
     iteration = 0
